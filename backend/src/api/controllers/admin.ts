@@ -2450,3 +2450,67 @@ export async function acknowledgeTransferAlert(
     next(err);
   }
 }
+
+// --- #1088 Admin CSV export for all vaults ----------------------------------------
+
+/**
+ * GET /api/v1/admin/reports/vaults.csv
+ *
+ * Streamed CSV export of all active and paused vaults with current metrics.
+ * Columns: contractId, name, status, tvlUsd, totalShares, latestApy, holderCount
+ */
+export async function exportVaultsCsv(_req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const rows = await query<{
+      contract_id: string;
+      name: string;
+      status: string;
+      tvl_usd: string | number;
+      total_shares: string | number;
+      latest_apy: string | number | null;
+      holder_count: string | number;
+    }>(
+      `SELECT v.contract_id, v.name, v.status,
+              COALESCE(v.tvl_usd, 0) AS tvl_usd,
+              COALESCE(v.total_shares, 0) AS total_shares,
+              v.latest_apy,
+              COALESCE(h.holder_count, 0) AS holder_count
+       FROM vaults v
+       LEFT JOIN (
+         SELECT vault_id, COUNT(DISTINCT user_address) AS holder_count
+         FROM user_vault_positions
+         WHERE shares > 0
+         GROUP BY vault_id
+       ) h ON h.vault_id = v.id
+       WHERE v.status IN ('active', 'paused')
+       ORDER BY v.name ASC`,
+    );
+
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", 'attachment; filename="vaults.csv"');
+
+    const csvStream = stringify({
+      header: true,
+      columns: ["contractId", "name", "status", "tvlUsd", "totalShares", "latestApy", "holderCount"],
+    });
+
+    csvStream.pipe(res);
+
+    for (const row of rows) {
+      csvStream.write([
+        row.contract_id,
+        row.name,
+        row.status,
+        row.tvl_usd,
+        row.total_shares,
+        row.latest_apy ?? "",
+        row.holder_count,
+      ]);
+    }
+
+    csvStream.end();
+  } catch (err) {
+    next(err);
+  }
+}
+
