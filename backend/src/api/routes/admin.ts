@@ -56,6 +56,7 @@ import {
   verifyArchiveConsistency,
   getApiDiff,
   getApiKeyUsageStats,
+  exportVaultsCsv,
 } from "../controllers/admin.js";
 import { getRequestArchive } from "../controllers/debugArchive.js";
 import { postArchiveRestore, getArchiveStatusHandler } from "../controllers/archiveAdmin.js";
@@ -74,6 +75,7 @@ adminRouter.use(ipAllowlist());
 adminRouter.use(requireApiKey({ minRole: "readonly" }));
 
 adminRouter.get("/stats", getAdminStats);
+adminRouter.get("/reports/vaults.csv", exportVaultsCsv);
 adminRouter.get("/indexer", getAdminIndexer);
 // Issue #1108: event counts per contract
 adminRouter.get("/indexer/event-counts", getIndexerEventCounts);

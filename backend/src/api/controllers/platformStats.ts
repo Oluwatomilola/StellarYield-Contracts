@@ -207,3 +207,60 @@ export async function getUserVaultActivity(req: Request, res: Response, next: Ne
     next(err);
   }
 }
+
+// --- #1087 platform deposit/withdrawal volume -------------------------------------
+
+/**
+ * GET /api/v1/platform/flows?period=1d|7d|30d
+ *
+ * Platform-wide capital flows:
+ *  - depositVolume: sum of deposits across all vaults within the period
+ *  - withdrawalVolume: sum of withdrawals across all vaults within the period
+ *  - netFlow: depositVolume - withdrawalVolume
+ */
+export async function getPlatformFlows(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const period = String(req.query["period"] ?? "30d").toLowerCase();
+    const daysMap: Record<string, number> = {
+      "1d": 1,
+      "7d": 7,
+      "30d": 30,
+    };
+
+    if (!daysMap[period]) {
+      res.status(400).json({
+        error: "BadRequest",
+        message: "Invalid period. Must be 1d, 7d, or 30d",
+      });
+      return;
+    }
+
+    const days = daysMap[period];
+    const rows = await query<{
+      deposit_volume: string | null;
+      withdrawal_volume: string | null;
+    }>(
+      `SELECT
+         COALESCE(SUM(CASE WHEN event_type = 'deposit' THEN COALESCE((parsed_data->>'assets')::numeric, (payload->>'assets')::numeric, 0) ELSE 0 END), 0)::text AS deposit_volume,
+         COALESCE(SUM(CASE WHEN event_type = 'withdraw' THEN COALESCE((parsed_data->>'assets')::numeric, (payload->>'assets')::numeric, 0) ELSE 0 END), 0)::text AS withdrawal_volume
+       FROM indexed_events
+       WHERE event_type IN ('deposit', 'withdraw')
+         AND created_at >= NOW() - make_interval(days => $1::int)`,
+      [days],
+    );
+
+    const depositVolume = Number(rows[0]?.deposit_volume ?? 0);
+    const withdrawalVolume = Number(rows[0]?.withdrawal_volume ?? 0);
+    const netFlow = depositVolume - withdrawalVolume;
+
+    res.json({
+      period,
+      depositVolume,
+      withdrawalVolume,
+      netFlow,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+

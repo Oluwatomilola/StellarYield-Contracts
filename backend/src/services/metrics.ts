@@ -89,7 +89,88 @@ export async function updateJobQueuePendingMetrics(): Promise<void> {
   }
 }
 
+export const nodejsHeapUsedBytes = new client.Gauge({
+  name: "nodejs_heap_used_bytes",
+  help: "Process heap memory used in bytes",
+  registers: [register],
+});
+
+export const nodejsHeapTotalBytes = new client.Gauge({
+  name: "nodejs_heap_total_bytes",
+  help: "Process heap memory total in bytes",
+  registers: [register],
+});
+
+export function updateProcessMemoryMetrics(): void {
+  try {
+    const mem = process.memoryUsage();
+    nodejsHeapUsedBytes.set(mem.heapUsed);
+    nodejsHeapTotalBytes.set(mem.heapTotal);
+  } catch {
+    // Ignore error
+  }
+}
+
+setInterval(updateProcessMemoryMetrics, 15000).unref();
+updateProcessMemoryMetrics();
+
+export const pgPoolTotal = new client.Gauge({
+  name: "pg_pool_total",
+  help: "Total number of clients in PostgreSQL pool",
+  registers: [register],
+});
+
+export const pgPoolIdle = new client.Gauge({
+  name: "pg_pool_idle",
+  help: "Number of idle clients in PostgreSQL pool",
+  registers: [register],
+});
+
+export const pgPoolWaiting = new client.Gauge({
+  name: "pg_pool_waiting",
+  help: "Number of queued requests waiting for PostgreSQL client",
+  registers: [register],
+});
+
+export const pgPoolTotalRead = new client.Gauge({
+  name: "pg_pool_total_read",
+  help: "Total number of clients in PostgreSQL read replica pool",
+  registers: [register],
+});
+
+export const pgPoolIdleRead = new client.Gauge({
+  name: "pg_pool_idle_read",
+  help: "Number of idle clients in PostgreSQL read replica pool",
+  registers: [register],
+});
+
+export const pgPoolWaitingRead = new client.Gauge({
+  name: "pg_pool_waiting_read",
+  help: "Number of queued requests waiting for PostgreSQL read replica client",
+  registers: [register],
+});
+
+export function updatePgPoolMetrics(
+  poolState: { totalCount: number; idleCount: number; waitingCount: number },
+  isReadReplica = false,
+): void {
+  try {
+    if (isReadReplica) {
+      pgPoolTotalRead.set(poolState.totalCount);
+      pgPoolIdleRead.set(poolState.idleCount);
+      pgPoolWaitingRead.set(poolState.waitingCount);
+    } else {
+      pgPoolTotal.set(poolState.totalCount);
+      pgPoolIdle.set(poolState.idleCount);
+      pgPoolWaiting.set(poolState.waitingCount);
+    }
+  } catch {
+    // Ignore error
+  }
+}
+
 export async function getMetrics(): Promise<string> {
+  updateProcessMemoryMetrics();
   await updateJobQueuePendingMetrics();
   return register.metrics();
 }
