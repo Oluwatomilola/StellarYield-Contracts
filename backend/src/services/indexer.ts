@@ -671,6 +671,28 @@ export class Indexer {
       return true;
     }
 
+    const epochFinalized = parseEpochFinalizedEvent(event);
+    if (epochFinalized) {
+      await this.recordEvent(event, "epoch_finalized", {
+        epochId: epochFinalized.epochId,
+        totalYield: epochFinalized.totalYield.toString(),
+        timestamp: epochFinalized.timestamp.toString(),
+      });
+      try {
+        await this.notificationService?.notify("epoch.finalized", {
+          contractId: event.contractId ?? "",
+          epochId: epochFinalized.epochId,
+          totalYield: epochFinalized.totalYield.toString(),
+          timestamp:
+            (typeof event.ledgerClosedAt === "string" && event.ledgerClosedAt) ||
+            new Date(Number(epochFinalized.timestamp) * 1000).toISOString(),
+        });
+      } catch (e) {
+        logger.warn({ err: e }, "NotificationService.notify failed for epoch.finalized");
+      }
+      return true;
+    }
+
     const cancelFunding = parseCancelFundingEvent(event);
     if (cancelFunding) {
       await this.handleCancelFunding(event.contractId ?? "");
@@ -2363,6 +2385,45 @@ export function parseYieldDistributedEvent(rawEvent: unknown): ParsedYieldDistri
     const timestamp = decodeBigInt(arr[1]);
 
     return { epoch, amount, timestamp };
+  } catch {
+    return null;
+  }
+}
+
+export interface ParsedEpochFinalizedEvent {
+  epochId: number;
+  totalYield: bigint;
+  timestamp: bigint;
+}
+
+export function parseEpochFinalizedEvent(rawEvent: unknown): ParsedEpochFinalizedEvent | null {
+  try {
+    if (!rawEvent || typeof rawEvent !== "object") return null;
+    const ev = rawEvent as Record<string, unknown>;
+    const topics = (ev["topic"] ?? ev["topics"]) as unknown[] | undefined;
+    const value = ev["value"] ?? ev["data"];
+
+    if (!Array.isArray(topics) || topics.length < 2 || value == null) return null;
+
+    const parsedTopics = topics.map((t) =>
+      typeof t === "string" ? xdr.ScVal.fromXDR(t, "base64") : (t as xdr.ScVal),
+    );
+    const parsedValue = typeof value === "string"
+      ? xdr.ScVal.fromXDR(value, "base64")
+      : value;
+
+    const eventName = String(scValToNative(parsedTopics[0]) ?? "");
+    if (eventName !== "epoch_finalized" && eventName !== "epoch_fin") return null;
+
+    const epochId = Number(scValToNative(parsedTopics[1]) ?? 0);
+    const data = scValToNative(parsedValue as xdr.ScVal);
+    const arr = Array.isArray(data) ? data : Object.values((data as Record<string, unknown>) ?? {});
+
+    return {
+      epochId,
+      totalYield: decodeBigInt(arr[0]),
+      timestamp: decodeBigInt(arr[1]),
+    };
   } catch {
     return null;
   }
