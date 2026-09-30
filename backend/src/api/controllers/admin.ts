@@ -12,12 +12,14 @@ import { config } from "../../config.js";
 import { seed } from "../../db/seed.js";
 import { indexer } from "../../services/indexerSingleton.js";
 import { KNOWN_EVENT_TYPES } from "../../services/indexerEventTypes.js";
+import { EpochAnomalyService } from "../../services/epochAnomaly.js";
 import { jobQueue } from "../../services/jobQueue.js";
 import { sseManager } from "../../services/sseManager.js";
 import { logger } from "../../logger.js";
 import { createAdminSessionToken, refreshAdminSessionToken } from "../middleware/auth.js";
 import { getApiKeyUsage } from "../../cache/redis.js";
 import { logAdminAudit } from "../../services/adminAuditLog.js";
+import { generateWebhookSecret, secretRotationWindowHours } from "../../services/webhookSignature.js";
 
 const OPENAPI_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "../../openapi");
 
@@ -714,12 +716,14 @@ export async function getWebhookDeliveries(req: Request, res: Response, next: Ne
     const rows = await query<{
       id: number;
       attempt: number;
+      status: string;
       delivered_at: Date | null;
       last_error: string | null;
       next_retry_at: Date | null;
+      replayed_from: number | null;
       created_at: Date;
     }>(
-      `SELECT id, attempt, delivered_at, last_error, next_retry_at, created_at
+      `SELECT id, attempt, status, delivered_at, last_error, next_retry_at, replayed_from, created_at
        FROM webhook_deliveries
        WHERE webhook_id = $1
        ORDER BY created_at DESC
@@ -731,9 +735,11 @@ export async function getWebhookDeliveries(req: Request, res: Response, next: Ne
       data: rows.map((r) => ({
         id: r.id,
         attempt: r.attempt,
+        status: r.status,
         deliveredAt: r.delivered_at,
         lastError: r.last_error,
         nextRetryAt: r.next_retry_at,
+        replayedFrom: r.replayed_from,
         createdAt: r.created_at,
       })),
       total,
@@ -776,6 +782,162 @@ export async function bulkToggleWebhooks(req: Request, res: Response, next: Next
     await logAdminAudit(req, "bulk_toggle_webhooks", "/api/v1/admin/webhooks/bulk/toggle");
 
     res.json({ updated: rows.length, ids: rows.map((r) => r.id), active });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * POST /admin/webhooks/:id/circuit-reset (#1061)
+ *
+ * Closes an open circuit so deliveries resume on the next triggered event.
+ * Also clears the failure counter that opened it, otherwise the very next
+ * failure would immediately re-trip the breaker.
+ */
+export async function resetWebhookCircuit(req: Request, res: Response, next: NextFunction) {
+  try {
+    const webhookId = parseInt(req.params["id"] as string, 10);
+    if (isNaN(webhookId) || webhookId <= 0) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid webhook ID" });
+      return;
+    }
+
+    const rows = await query<{ id: number; circuit_open: boolean }>(
+      `UPDATE webhooks
+          SET circuit_open = FALSE, circuit_opened_at = NULL, consecutive_failures = 0
+        WHERE id = $1
+        RETURNING id, circuit_open`,
+      [webhookId],
+    );
+    if (rows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: "Webhook not found" });
+      return;
+    }
+
+    await logAdminAudit(req, "webhook_circuit_reset", `/api/v1/admin/webhooks/${webhookId}/circuit-reset`);
+
+    res.json({ id: webhookId, circuitOpen: false, consecutiveFailures: 0 });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * POST /admin/webhooks/:id/rotate-secret (#1062)
+ *
+ * Issues a fresh HMAC secret and keeps the outgoing one valid for
+ * SECRET_ROTATION_WINDOW_HOURS so receivers can roll over without downtime.
+ * The new secret is returned once; neither secret is ever readable again.
+ */
+export async function rotateWebhookSecret(req: Request, res: Response, next: NextFunction) {
+  try {
+    const webhookId = parseInt(req.params["id"] as string, 10);
+    if (isNaN(webhookId) || webhookId <= 0) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid webhook ID" });
+      return;
+    }
+
+    const newSecret = generateWebhookSecret();
+    const windowHours = secretRotationWindowHours();
+
+    const rows = await query<{ id: number; had_secret: boolean }>(
+      `UPDATE webhooks
+          SET previous_secret = secret,
+              secret = $1,
+              secret_rotated_at = NOW()
+        WHERE id = $2
+        RETURNING id, previous_secret IS NOT NULL AS had_secret`,
+      [newSecret, webhookId],
+    );
+    if (rows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: "Webhook not found" });
+      return;
+    }
+
+    await logAdminAudit(req, "webhook_rotate_secret", `/api/v1/admin/webhooks/${webhookId}/rotate-secret`);
+
+    res.json({
+      id: webhookId,
+      secret: newSecret,
+      rotationWindowHours: windowHours,
+      previousSecretRetained: rows[0].had_secret,
+      rotatesAt: new Date(Date.now() + windowHours * 60 * 60 * 1000).toISOString(),
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * POST /admin/webhooks/deliveries/:deliveryId/replay (#1063)
+ *
+ * Re-enqueues a past delivery verbatim from the delivery log, without
+ * re-indexing the underlying event. The clone is a new row that references
+ * the source via `replayed_from`.
+ */
+export async function replayWebhookDelivery(req: Request, res: Response, next: NextFunction) {
+  try {
+    const deliveryId = parseInt(req.params["deliveryId"] as string, 10);
+    if (isNaN(deliveryId) || deliveryId <= 0) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid delivery ID" });
+      return;
+    }
+
+    const source = await query<{
+      id: number;
+      webhook_id: number;
+      payload: string;
+      circuit_open: boolean;
+      active: boolean;
+    }>(
+      `SELECT wd.id, wd.webhook_id, wd.payload::text AS payload,
+              w.circuit_open, w.active
+         FROM webhook_deliveries wd
+         JOIN webhooks w ON w.id = wd.webhook_id
+        WHERE wd.id = $1`,
+      [deliveryId],
+    );
+    if (source.length === 0) {
+      res.status(404).json({ error: "NotFound", message: "Delivery not found" });
+      return;
+    }
+
+    const original = source[0];
+    if (original.circuit_open) {
+      res.status(409).json({
+        error: "Conflict",
+        message:
+          "Webhook circuit is open; reset it before replaying deliveries for this endpoint",
+      });
+      return;
+    }
+
+    const inserted = await query<{ id: number }>(
+      `INSERT INTO webhook_deliveries
+         (webhook_id, payload, attempt, next_retry_at, replayed_from, status)
+       VALUES ($1, $2, 1, NOW(), $3, 'pending')
+       RETURNING id`,
+      [original.webhook_id, original.payload, original.id],
+    );
+
+    await jobQueue.send("webhook-deliver", {
+      webhookId: original.webhook_id,
+      payload: original.payload,
+      deliveryId: inserted[0].id,
+    });
+
+    await logAdminAudit(
+      req,
+      "webhook_replay_delivery",
+      `/api/v1/admin/webhooks/deliveries/${deliveryId}/replay`,
+    );
+
+    res.status(201).json({
+      deliveryId: inserted[0].id,
+      replayedFrom: original.id,
+      webhookId: original.webhook_id,
+      status: "queued",
+    });
   } catch (err) {
     next(err);
   }
@@ -2151,3 +2313,204 @@ export async function getQuarterlyYieldReport(req: Request, res: Response, next:
     next(err);
   }
 }
+
+// ── Issues #1077, #1078: Transfer Alerts ───────────────────────────────────────
+
+interface TransferAlertRow {
+  id: number;
+  vault_id: number | null;
+  contract_id: string | null;
+  type: string;
+  amount: string | null;
+  from_address: string | null;
+  to_address: string | null;
+  tx_hash: string | null;
+  details: Record<string, unknown> | null;
+  created_at: Date;
+  acknowledged_at: Date | null;
+}
+
+/**
+ * GET /api/v1/admin/transfer-alerts
+ * Lists transfer alerts. By default, returns unacknowledged alerts.
+ */
+export async function getTransferAlerts(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const { acknowledged, status } = req.query as { acknowledged?: string; status?: string };
+
+    let whereClause = "WHERE acknowledged_at IS NULL";
+    if (acknowledged === "true" || status === "acknowledged") {
+      whereClause = "WHERE acknowledged_at IS NOT NULL";
+    } else if (acknowledged === "all" || status === "all") {
+      whereClause = "";
+    }
+
+    const rows = await query<TransferAlertRow>(
+      `SELECT id, vault_id, contract_id, type, amount, from_address, to_address, tx_hash, details, created_at, acknowledged_at
+       FROM transfer_alerts
+       ${whereClause}
+       ORDER BY created_at DESC`,
+    );
+
+    res.json(
+      rows.map((row) => ({
+        id: row.id,
+        vaultId: row.vault_id,
+        contractId: row.contract_id,
+        type: row.type,
+        amount: row.amount ? String(row.amount) : null,
+        fromAddress: row.from_address,
+        toAddress: row.to_address,
+        txHash: row.tx_hash,
+        details: row.details,
+        createdAt: row.created_at,
+        acknowledgedAt: row.acknowledged_at,
+      })),
+    );
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * GET /api/v1/admin/vaults/:contractId/epoch-anomalies (#1073)
+ *
+ * Lists the epochs whose yield sat far from that vault's own recent history, so
+ * an operator can tell a genuine change in the underlying asset apart from an
+ * indexing fault. Read-only: detection runs on its own schedule and this
+ * endpoint only reports what it found.
+ */
+export async function getEpochAnomalies(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+
+    // Newest epoch first, so the most recent flag is at the top of the response.
+    const rawLimit = parseInt(String(req.query["limit"] ?? "100"), 10);
+    const limit = Math.max(1, Math.min(500, isNaN(rawLimit) ? 100 : rawLimit));
+
+    const anomalies = await new EpochAnomalyService().listForVault(parsed.data, limit);
+    res.json(anomalies);
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * PATCH /api/v1/admin/transfer-alerts/:id/acknowledge
+ * Marks a transfer alert as acknowledged.
+ */
+export async function acknowledgeTransferAlert(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (Number.isNaN(id) || id <= 0) {
+      res.status(400).json({ error: "Invalid alert id" });
+      return;
+    }
+
+    const rows = await query<TransferAlertRow>(
+      `UPDATE transfer_alerts
+       SET acknowledged_at = NOW()
+       WHERE id = $1
+       RETURNING id, vault_id, contract_id, type, amount, from_address, to_address, tx_hash, details, created_at, acknowledged_at`,
+      [id],
+    );
+
+    if (rows.length === 0) {
+      res.status(404).json({ error: "Transfer alert not found" });
+      return;
+    }
+
+    const row = rows[0];
+    res.json({
+      id: row.id,
+      vaultId: row.vault_id,
+      contractId: row.contract_id,
+      type: row.type,
+      amount: row.amount ? String(row.amount) : null,
+      fromAddress: row.from_address,
+      toAddress: row.to_address,
+      txHash: row.tx_hash,
+      details: row.details,
+      createdAt: row.created_at,
+      acknowledgedAt: row.acknowledged_at,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// --- #1088 Admin CSV export for all vaults ----------------------------------------
+
+/**
+ * GET /api/v1/admin/reports/vaults.csv
+ *
+ * Streamed CSV export of all active and paused vaults with current metrics.
+ * Columns: contractId, name, status, tvlUsd, totalShares, latestApy, holderCount
+ */
+export async function exportVaultsCsv(_req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const rows = await query<{
+      contract_id: string;
+      name: string;
+      status: string;
+      tvl_usd: string | number;
+      total_shares: string | number;
+      latest_apy: string | number | null;
+      holder_count: string | number;
+    }>(
+      `SELECT v.contract_id, v.name, v.status,
+              COALESCE(v.tvl_usd, 0) AS tvl_usd,
+              COALESCE(v.total_shares, 0) AS total_shares,
+              v.latest_apy,
+              COALESCE(h.holder_count, 0) AS holder_count
+       FROM vaults v
+       LEFT JOIN (
+         SELECT vault_id, COUNT(DISTINCT user_address) AS holder_count
+         FROM user_vault_positions
+         WHERE shares > 0
+         GROUP BY vault_id
+       ) h ON h.vault_id = v.id
+       WHERE v.status IN ('active', 'paused')
+       ORDER BY v.name ASC`,
+    );
+
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", 'attachment; filename="vaults.csv"');
+
+    const csvStream = stringify({
+      header: true,
+      columns: ["contractId", "name", "status", "tvlUsd", "totalShares", "latestApy", "holderCount"],
+    });
+
+    csvStream.pipe(res);
+
+    for (const row of rows) {
+      csvStream.write([
+        row.contract_id,
+        row.name,
+        row.status,
+        row.tvl_usd,
+        row.total_shares,
+        row.latest_apy ?? "",
+        row.holder_count,
+      ]);
+    }
+
+    csvStream.end();
+  } catch (err) {
+    next(err);
+  }
+}
+

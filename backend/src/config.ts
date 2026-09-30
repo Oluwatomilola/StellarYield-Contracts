@@ -57,6 +57,14 @@ export const envSchema = z.object({
     .transform((v) => parseInt(v, 10))
     .pipe(z.number().int().min(100)),
   SANCTIONS_LIST_URL: z.string().optional(),
+  TRANSFER_VELOCITY_THRESHOLD: z
+    .string()
+    .default("500")
+    .transform((v) => parseInt(v, 10))
+    .pipe(z.number().int().min(1)),
+  LARGE_TRANSFER_THRESHOLD: z
+    .string()
+    .default("1000000"),
   INDEXER_BATCH_SIZE: z
     .string()
     .default("200")
@@ -70,6 +78,13 @@ export const envSchema = z.object({
   WEBHOOK_SECRET: z
     .string()
     .default(""),
+  // Issue #1062: hours a rotated-out webhook secret stays valid alongside the
+  // new one, so receivers can roll over without downtime.
+  SECRET_ROTATION_WINDOW_HOURS: z
+    .string()
+    .default("24")
+    .transform((v) => parseInt(v, 10))
+    .pipe(z.number().int().min(0)),
   LOG_LEVEL: z
     .string()
     .default("info"),
@@ -289,6 +304,12 @@ export const config = {
   get sanctionsListUrl(): string | undefined {
     return process.env.SANCTIONS_LIST_URL ?? parsed.data.SANCTIONS_LIST_URL;
   },
+  get transferVelocityThreshold(): number {
+    return Number(process.env.TRANSFER_VELOCITY_THRESHOLD ?? parsed.data.TRANSFER_VELOCITY_THRESHOLD);
+  },
+  get largeTransferThreshold(): string {
+    return process.env.LARGE_TRANSFER_THRESHOLD ?? parsed.data.LARGE_TRANSFER_THRESHOLD;
+  },
   get sandboxMode() {
     return (process.env.SANDBOX_MODE ?? String(parsed.data.SANDBOX_MODE)).toLowerCase() === "true" || process.env.SANDBOX_MODE === "1";
   },
@@ -341,6 +362,7 @@ export const config = {
   })(),
 
   webhookSecret: parsed.data.WEBHOOK_SECRET,
+  secretRotationWindowHours: parsed.data.SECRET_ROTATION_WINDOW_HOURS,
   logLevel: parsed.data.LOG_LEVEL,
 
   rateLimit: {
