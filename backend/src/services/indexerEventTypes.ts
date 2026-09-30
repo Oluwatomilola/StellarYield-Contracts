@@ -53,6 +53,13 @@ export const TOPIC_EVENT_TYPES: Record<string, string> = {
   v_unpause: "unpaused",
   vault_name_updated: "vault_name_updated",
   v_name_upd: "vault_name_updated",
+  transfer: "transfer",
+  transfer_fee_collected: "transfer_fee_collected",
+  xfr_fee: "transfer_fee_collected",
+  v_status: "vault_status_changed",
+  vault_status_changed: "vault_status_changed",
+  mgr_chg: "vault_manager_changed",
+  vault_manager_changed: "vault_manager_changed",
 };
 
 /** Every name accepted by the event-type filter: stored types and topic symbols. */

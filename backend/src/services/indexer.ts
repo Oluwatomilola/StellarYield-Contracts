@@ -23,6 +23,7 @@ import { cacheDel } from "../cache/redis.js";
 import { sseService } from "./sse.js";
 import { recordRpcSuccess, recordRpcError } from "./rpcMonitor.js";
 import { TOPIC_EVENT_TYPES } from "./indexerEventTypes.js";
+import { logSystemAudit } from "./adminAuditLog.js";
 
 // ── Lightweight trace spans (#827) ────────────────────────────────────────────
 // No external tracing dependency — spans are emitted as structured pino log
@@ -73,6 +74,13 @@ function toBigIntOrZero(value: string | null | undefined): bigint {
   } catch {
     return 0n;
   }
+}
+
+// When an event happened on-chain: the ledger close time, or now if the RPC
+// response did not include it.
+function eventChangedAt(rawEvent: any): Date {
+  const closedAt = typeof rawEvent?.ledgerClosedAt === "string" ? new Date(rawEvent.ledgerClosedAt) : null;
+  return closedAt && !Number.isNaN(closedAt.getTime()) ? closedAt : new Date();
 }
 
 function getEventTopics(rawEvent: any): unknown[] | null {
@@ -738,7 +746,7 @@ export class Indexer {
 
     const vaultCreated = parseVaultCreatedEvent(event);
     if (vaultCreated) {
-      await this.handleVaultCreated(event.contractId ?? "", vaultCreated);
+      await this.handleVaultCreated(event.contractId ?? "", vaultCreated, event);
       await this.recordEvent(event, "vault_created");
       try {
         await this.notificationService?.notify("vault_created", vaultCreated as any);
@@ -1027,6 +1035,65 @@ export class Indexer {
         address: whitelistUpdated.address,
         action: whitelistUpdated.action,
         caller: whitelistUpdated.caller,
+      });
+      return true;
+    }
+
+    // ── #1065: vault_status_changed ───────────────────────────────────────────
+    const vaultStatusChanged = parseVaultStatusChangedEvent(event);
+    if (vaultStatusChanged) {
+      const previousStatus = await this.handleVaultStatusChanged(vaultStatusChanged, event);
+      await this.recordEvent(event, "vault_status_changed", {
+        vault: vaultStatusChanged.vault,
+        previousStatus,
+        newStatus: vaultStatusChanged.status,
+      });
+      return true;
+    }
+
+    // ── #1068: vault_manager_changed ──────────────────────────────────────────
+    const managerChanged = parseVaultManagerChangedEvent(event);
+    if (managerChanged) {
+      const previousManager = await this.handleVaultManagerChanged(managerChanged, event);
+      await this.recordEvent(event, "vault_manager_changed", {
+        vault: managerChanged.vault,
+        previousManager,
+        newManager: managerChanged.newManager,
+      });
+      try {
+        await this.notificationService?.notify("vault.manager_changed", {
+          contractId: managerChanged.vault,
+          previousManager,
+          newManager: managerChanged.newManager,
+          txHash: event.txHash ?? event.id ?? "",
+          ledger: event.ledger ?? 0,
+        });
+      } catch (e) {
+        logger.warn({ err: e }, "NotificationService.notify failed for vault.manager_changed");
+      }
+      return true;
+    }
+
+    // ── #1077 / #1113: transfer ───────────────────────────────────────────────
+    const transfer = parseTransferEvent(event);
+    if (transfer) {
+      await this.handleTransfer(event.contractId ?? "", transfer, event);
+      await this.recordEvent(event, "transfer", {
+        from: transfer.from,
+        to: transfer.to,
+        amount: transfer.amount.toString(),
+      });
+      return true;
+    }
+
+    // ── #1076: transfer_fee_collected ────────────────────────────────────────
+    const transferFee = parseTransferFeeCollectedEvent(event);
+    if (transferFee) {
+      await this.handleTransferFeeCollected(event.contractId ?? transferFee.contractId ?? "", transferFee, event);
+      await this.recordEvent(event, "transfer_fee_collected", {
+        from: transferFee.from,
+        to: transferFee.to,
+        feeAmount: transferFee.feeAmount.toString(),
       });
       return true;
     }
@@ -1329,6 +1396,7 @@ export class Indexer {
       minDeposit: string | null;
       maxDepositPerUser: string | null;
     },
+    rawEvent?: { ledger?: number; id?: string; txHash?: string } | null,
   ): Promise<void> {
     logger.info(
       { vault: vaultCreated.contractId, factoryId, name: vaultCreated.name },
@@ -1359,6 +1427,23 @@ export class Indexer {
     });
 
     this.watchedContractIds.add(vaultCreated.contractId);
+
+    // Compliance trace (#1064): record where this vault came from. The insert
+    // is replay-guarded so a backfill re-reading the ledger range cannot
+    // produce a second entry for the same vault.
+    try {
+      await logSystemAudit(
+        "VAULT_INDEXED",
+        vaultCreated.contractId,
+        {
+          blockNumber: rawEvent?.ledger ?? null,
+          txHash: rawEvent?.txHash ?? rawEvent?.id ?? "",
+        },
+        { conflictTarget: true },
+      );
+    } catch (e) {
+      logger.warn({ err: e, vault: vaultCreated.contractId }, "Failed to write VAULT_INDEXED audit entry");
+    }
   }
 
   private async handleCancelFunding(contractId: string): Promise<void> {
@@ -1792,6 +1877,74 @@ export class Indexer {
     );
   }
 
+  /**
+   * Apply a `vault_status_changed` event (#1065): update vaults.status and
+   * append a vault_status_history row. Returns the status the vault had
+   * before, or null when the vault is not indexed yet.
+   */
+  private async handleVaultStatusChanged(
+    ev: ParsedVaultStatusChangedEvent,
+    rawEvent: any,
+  ): Promise<string | null> {
+    const prev = await query<{ status: string }>(
+      "SELECT status FROM vaults WHERE contract_id = $1",
+      [ev.vault],
+    );
+    const previousStatus = prev[0]?.status ?? null;
+
+    await query(
+      "UPDATE vaults SET status = $1, updated_at = NOW() WHERE contract_id = $2",
+      [ev.status, ev.vault],
+    );
+    // The history row is written even for a vault the indexer has not seen
+    // yet: the on-chain transition happened and must be auditable.
+    await query(
+      `INSERT INTO vault_status_history
+         (contract_id, event_type, previous_status, new_status, changed_at, tx_hash, ledger)
+       VALUES ($1, 'status_changed', $2, $3, $4, $5, $6)
+       ON CONFLICT (contract_id, event_type, tx_hash, ledger) DO NOTHING`,
+      [ev.vault, previousStatus, ev.status, eventChangedAt(rawEvent), rawEvent.txHash ?? rawEvent.id ?? "", rawEvent.ledger ?? 0],
+    );
+    logger.info(
+      { contractId: ev.vault, previousStatus, newStatus: ev.status },
+      "Processed vault_status_changed event",
+    );
+    return previousStatus;
+  }
+
+  /**
+   * Apply a `vault_manager_changed` event (#1068): update
+   * vaults.manager_address and append a vault_status_history row. Returns the
+   * previous manager (from the event, falling back to the stored value).
+   */
+  private async handleVaultManagerChanged(
+    ev: ParsedVaultManagerChangedEvent,
+    rawEvent: any,
+  ): Promise<string | null> {
+    const prev = await query<{ manager_address: string | null }>(
+      "SELECT manager_address FROM vaults WHERE contract_id = $1",
+      [ev.vault],
+    );
+    const previousManager = ev.oldManager ?? prev[0]?.manager_address ?? null;
+
+    await query(
+      "UPDATE vaults SET manager_address = $1, updated_at = NOW() WHERE contract_id = $2",
+      [ev.newManager, ev.vault],
+    );
+    await query(
+      `INSERT INTO vault_status_history
+         (contract_id, event_type, previous_manager, new_manager, changed_at, tx_hash, ledger)
+       VALUES ($1, 'manager_changed', $2, $3, $4, $5, $6)
+       ON CONFLICT (contract_id, event_type, tx_hash, ledger) DO NOTHING`,
+      [ev.vault, previousManager, ev.newManager, eventChangedAt(rawEvent), rawEvent.txHash ?? rawEvent.id ?? "", rawEvent.ledger ?? 0],
+    );
+    logger.info(
+      { contractId: ev.vault, previousManager, newManager: ev.newManager },
+      "Processed vault_manager_changed event",
+    );
+    return previousManager;
+  }
+
   private async handleZkmeVerifierUpdated(
     contractId: string,
     ev: { newVerifier: string },
@@ -1837,6 +1990,91 @@ export class Indexer {
   ): Promise<void> {
     await this.userService.upsertUser(ev.user, ev.verified);
     logger.info({ contractId, user: ev.user, verified: ev.verified }, "Processed kyc_set event");
+  }
+
+  private async handleTransfer(
+    contractId: string,
+    transfer: ParsedTransferEvent,
+    event: any,
+  ): Promise<void> {
+    let vaultId: number | null = null;
+    try {
+      const vaultRows = await query<{ id: number }>(
+        "SELECT id FROM vaults WHERE contract_id = $1",
+        [contractId],
+      );
+      if (vaultRows.length > 0) {
+        vaultId = vaultRows[0].id;
+      }
+    } catch (err) {
+      logger.warn({ err, contractId }, "Failed to find vault for transfer");
+    }
+
+    const txHash = event.id ?? event.txHash ?? null;
+    const ledger = typeof event.ledger === "number" ? event.ledger : null;
+    const amountStr = transfer.amount.toString();
+
+    // 1. Insert into transfers table
+    await query(
+      `INSERT INTO transfers (vault_id, from_address, to_address, amount, tx_hash, ledger, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+      [vaultId, transfer.from, transfer.to, amountStr, txHash, ledger],
+    );
+
+    // 2. Issue #1077: Check LARGE_TRANSFER_THRESHOLD
+    try {
+      const largeThreshold = BigInt(config.largeTransferThreshold);
+      if (transfer.amount > largeThreshold) {
+        logger.warn(
+          {
+            contractId,
+            vaultId,
+            from: transfer.from,
+            to: transfer.to,
+            amount: amountStr,
+            threshold: largeThreshold.toString(),
+          },
+          "Large transfer alert: transfer amount exceeds threshold",
+        );
+
+        await query(
+          `INSERT INTO transfer_alerts (vault_id, contract_id, type, amount, from_address, to_address, tx_hash, details, created_at)
+           VALUES ($1, $2, 'LARGE_TRANSFER', $3, $4, $5, $6, $7, NOW())`,
+          [
+            vaultId,
+            contractId,
+            amountStr,
+            transfer.from,
+            transfer.to,
+            txHash,
+            JSON.stringify({
+              threshold: largeThreshold.toString(),
+              amount: amountStr,
+              from: transfer.from,
+              to: transfer.to,
+            }),
+          ],
+        );
+      }
+    } catch (err) {
+      logger.warn({ err, contractId }, "Failed to process large transfer check");
+    }
+  }
+
+  private async handleTransferFeeCollected(
+    contractId: string,
+    feeEvent: ParsedTransferFeeCollectedEvent,
+    event: any,
+  ): Promise<void> {
+    const txHash = event.id ?? event.txHash ?? null;
+    const ledger = typeof event.ledger === "number" ? event.ledger : null;
+    const feeAmountStr = feeEvent.feeAmount.toString();
+
+    await query(
+      `INSERT INTO transfer_fees (contract_id, from_address, to_address, fee_amount, tx_hash, ledger, fee_type, created_at, collected_at)
+       VALUES ($1, $2, $3, $4, $5, $6, 'transfer_fee', NOW(), NOW())`,
+      [contractId, feeEvent.from, feeEvent.to, feeAmountStr, txHash, ledger],
+    );
   }
 
   private async recordEvent(
@@ -3620,3 +3858,259 @@ export function parseWhitelistUpdatedEvent(rawEvent: unknown): ParsedWhitelistUp
     return null;
   }
 }
+
+// ── #1065: parseVaultStatusChangedEvent ───────────────────────────────────────
+
+export type VaultStatus = "active" | "inactive";
+
+export interface ParsedVaultStatusChangedEvent {
+  /** The vault whose status changed (not the emitting factory). */
+  vault: string;
+  status: VaultStatus;
+}
+
+function decodeVaultStatus(native: unknown): VaultStatus | null {
+  if (typeof native === "boolean") return native ? "active" : "inactive";
+  if (typeof native === "string") {
+    const s = native.toLowerCase();
+    return s === "active" || s === "inactive" ? s : null;
+  }
+  if (Array.isArray(native)) return decodeVaultStatus(native[0]);
+  if (native && typeof native === "object") {
+    const obj = native as Record<string, unknown>;
+    return decodeVaultStatus(obj["active"] ?? obj["status"]);
+  }
+  return null;
+}
+
+/**
+ * Parses the factory's `v_status` (a.k.a. `vault_status_changed`) event,
+ * emitted by `set_vault_status`. Topics are (symbol, vault) and the data is
+ * the new active flag. A vault emitting the event about itself may omit the
+ * vault topic, in which case the emitting contract is the vault.
+ */
+export function parseVaultStatusChangedEvent(rawEvent: unknown): ParsedVaultStatusChangedEvent | null {
+  try {
+    if (!rawEvent || typeof rawEvent !== "object") return null;
+    const ev = rawEvent as Record<string, unknown>;
+    const topics = (ev["topic"] ?? ev["topics"]) as unknown[] | undefined;
+    const value = ev["value"] ?? ev["data"];
+
+    if (!Array.isArray(topics) || topics.length < 1 || value == null) return null;
+
+    const parsedTopics = topics.map((t) =>
+      typeof t === "string" ? xdr.ScVal.fromXDR(t, "base64") : (t as xdr.ScVal),
+    );
+    const parsedValue = typeof value === "string"
+      ? xdr.ScVal.fromXDR(value, "base64")
+      : value;
+
+    let eventName: string;
+    try {
+      eventName = String(scValToNative(parsedTopics[0]) ?? "");
+    } catch {
+      return null;
+    }
+    if (eventName !== "v_status" && eventName !== "vault_status_changed") return null;
+
+    const vault = topics.length > 1
+      ? String(scValToNative(parsedTopics[1]) ?? "")
+      : String(ev["contractId"] ?? "");
+    if (!vault) return null;
+
+    const status = decodeVaultStatus(scValToNative(parsedValue as xdr.ScVal));
+    if (!status) return null;
+
+    return { vault, status };
+  } catch {
+    return null;
+  }
+}
+
+// ── #1068: parseVaultManagerChangedEvent ──────────────────────────────────────
+
+export interface ParsedVaultManagerChangedEvent {
+  /** The vault whose manager changed. */
+  vault: string;
+  /** Previous manager as reported by the event, or null when not emitted. */
+  oldManager: string | null;
+  newManager: string;
+}
+
+/**
+ * Parses a `vault_manager_changed` (a.k.a. `mgr_chg`) event. The vault is the
+ * contract address in topics[1] when a factory emits the event, otherwise the
+ * emitting contract. The data is either (old_manager, new_manager), a struct
+ * with those fields, or just the new manager address.
+ */
+export function parseVaultManagerChangedEvent(rawEvent: unknown): ParsedVaultManagerChangedEvent | null {
+  try {
+    if (!rawEvent || typeof rawEvent !== "object") return null;
+    const ev = rawEvent as Record<string, unknown>;
+    const topics = (ev["topic"] ?? ev["topics"]) as unknown[] | undefined;
+    const value = ev["value"] ?? ev["data"];
+
+    if (!Array.isArray(topics) || topics.length < 1 || value == null) return null;
+
+    const parsedTopics = topics.map((t) =>
+      typeof t === "string" ? xdr.ScVal.fromXDR(t, "base64") : (t as xdr.ScVal),
+    );
+    const parsedValue = typeof value === "string"
+      ? xdr.ScVal.fromXDR(value, "base64")
+      : value;
+
+    let eventName: string;
+    try {
+      eventName = String(scValToNative(parsedTopics[0]) ?? "");
+    } catch {
+      return null;
+    }
+    if (eventName !== "vault_manager_changed" && eventName !== "mgr_chg") return null;
+
+    // Only a contract address (C...) in topics[1] names the vault; anything
+    // else there is an account and the emitting contract is the vault.
+    const topicVault = topics.length > 1 ? String(scValToNative(parsedTopics[1]) ?? "") : "";
+    const vault = topicVault.startsWith("C") ? topicVault : String(ev["contractId"] ?? "");
+    if (!vault) return null;
+
+    const data = scValToNative(parsedValue as xdr.ScVal) as unknown;
+    let oldManager: unknown = null;
+    let newManager: unknown;
+    if (Array.isArray(data)) {
+      [oldManager, newManager] = data.length > 1 ? data : [null, data[0]];
+    } else if (data && typeof data === "object") {
+      const obj = data as Record<string, unknown>;
+      oldManager = obj["old_manager"] ?? obj["oldManager"] ?? null;
+      newManager = obj["new_manager"] ?? obj["newManager"];
+    } else {
+      newManager = data;
+    }
+
+    if (typeof newManager !== "string" || !newManager) return null;
+
+    return {
+      vault,
+      oldManager: typeof oldManager === "string" && oldManager ? oldManager : null,
+      newManager,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export interface ParsedTransferEvent {
+  from: string;
+  to: string;
+  amount: bigint;
+}
+
+export function parseTransferEvent(rawEvent: unknown): ParsedTransferEvent | null {
+  try {
+    if (!rawEvent || typeof rawEvent !== "object") return null;
+    const ev = rawEvent as Record<string, unknown>;
+    const topics = (ev["topic"] ?? ev["topics"]) as unknown[] | undefined;
+    const value = ev["value"] ?? ev["data"];
+
+    if (!Array.isArray(topics) || topics.length < 3 || value == null) return null;
+
+    const parsedTopics = topics.map((t) =>
+      typeof t === "string" ? xdr.ScVal.fromXDR(t, "base64") : (t as xdr.ScVal),
+    );
+    const parsedValue = typeof value === "string"
+      ? xdr.ScVal.fromXDR(value, "base64")
+      : value;
+
+    let eventName: string;
+    try {
+      eventName = String(scValToNative(parsedTopics[0]) ?? "");
+    } catch {
+      return null;
+    }
+    if (eventName !== "transfer") return null;
+
+    const from = String(scValToNative(parsedTopics[1]) ?? "");
+    const to = String(scValToNative(parsedTopics[2]) ?? "");
+    if (!from || !to) return null;
+
+    const data = parsedValue instanceof xdr.ScVal ? scValToNative(parsedValue) : parsedValue;
+    const amount = decodeBigInt(data);
+
+    return { from, to, amount };
+  } catch {
+    return null;
+  }
+}
+
+export interface ParsedTransferFeeCollectedEvent {
+  from: string;
+  to: string;
+  feeAmount: bigint;
+  contractId?: string;
+}
+
+export function parseTransferFeeCollectedEvent(rawEvent: unknown): ParsedTransferFeeCollectedEvent | null {
+  try {
+    if (!rawEvent || typeof rawEvent !== "object") return null;
+    const ev = rawEvent as Record<string, unknown>;
+    const topics = (ev["topic"] ?? ev["topics"]) as unknown[] | undefined;
+    const value = ev["value"] ?? ev["data"];
+
+    if (!Array.isArray(topics) || topics.length < 1 || value == null) return null;
+
+    const parsedTopics = topics.map((t) =>
+      typeof t === "string" ? xdr.ScVal.fromXDR(t, "base64") : (t as xdr.ScVal),
+    );
+    const parsedValue = typeof value === "string"
+      ? xdr.ScVal.fromXDR(value, "base64")
+      : value;
+
+    let eventName: string;
+    try {
+      eventName = String(scValToNative(parsedTopics[0]) ?? "");
+    } catch {
+      return null;
+    }
+    if (eventName !== "transfer_fee_collected" && eventName !== "xfr_fee" && eventName !== "transfer_fee") {
+      return null;
+    }
+
+    let from = "";
+    let to = "";
+    let feeAmount = 0n;
+
+    if (parsedTopics.length >= 3) {
+      from = String(scValToNative(parsedTopics[1]) ?? "");
+      to = String(scValToNative(parsedTopics[2]) ?? "");
+      const data = parsedValue instanceof xdr.ScVal ? scValToNative(parsedValue) : parsedValue;
+      feeAmount = decodeBigInt(data);
+    } else {
+      const data = parsedValue instanceof xdr.ScVal ? scValToNative(parsedValue) : parsedValue;
+      if (Array.isArray(data)) {
+        if (data.length >= 3) {
+          from = String(data[0] ?? "");
+          to = String(data[1] ?? "");
+          feeAmount = decodeBigInt(data[2]);
+        } else if (data.length === 1) {
+          feeAmount = decodeBigInt(data[0]);
+        }
+      } else if (data && typeof data === "object") {
+        from = String((data as any).from ?? (data as any).from_address ?? (data as any).fromAddress ?? "");
+        to = String((data as any).to ?? (data as any).to_address ?? (data as any).toAddress ?? "");
+        feeAmount = decodeBigInt((data as any).feeAmount ?? (data as any).fee_amount ?? (data as any).amount ?? (data as any).fee ?? 0);
+      } else {
+        feeAmount = decodeBigInt(data);
+      }
+    }
+
+    return {
+      from,
+      to,
+      feeAmount,
+      contractId: typeof ev["contractId"] === "string" ? ev["contractId"] : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+

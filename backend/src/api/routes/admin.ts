@@ -4,10 +4,13 @@ import {
   getAdminIndexer,
   getIndexerEventCounts,
   getQuarterlyYieldReport,
+  getTransferAlerts,
+  acknowledgeTransferAlert,
   getIndexerStartBlock,
   updateIndexerStartBlock,
   getAdminEvents,
   getVaultAudit,
+  getEpochAnomalies,
   backfillIndexer,
   pauseContractIndexing,
   resumeContractIndexing,
@@ -17,6 +20,9 @@ import {
   updateApiKeyDescription,
   getWebhookDeliveries,
   bulkToggleWebhooks,
+  resetWebhookCircuit,
+  rotateWebhookSecret,
+  replayWebhookDelivery,
   getArchivedVaults,
   getTotalSupplyConsistency,
   getDbStats,
@@ -50,6 +56,7 @@ import {
   verifyArchiveConsistency,
   getApiDiff,
   getApiKeyUsageStats,
+  exportVaultsCsv,
 } from "../controllers/admin.js";
 import { getRequestArchive } from "../controllers/debugArchive.js";
 import { postArchiveRestore, getArchiveStatusHandler } from "../controllers/archiveAdmin.js";
@@ -68,6 +75,7 @@ adminRouter.use(ipAllowlist());
 adminRouter.use(requireApiKey({ minRole: "readonly" }));
 
 adminRouter.get("/stats", getAdminStats);
+adminRouter.get("/reports/vaults.csv", exportVaultsCsv);
 adminRouter.get("/indexer", getAdminIndexer);
 // Issue #1108: event counts per contract
 adminRouter.get("/indexer/event-counts", getIndexerEventCounts);
@@ -93,6 +101,9 @@ adminRouter.get("/indexer/start-block", getIndexerStartBlock);
 adminRouter.put("/indexer/start-block", requireApiKey({ role: "admin" }), updateIndexerStartBlock);
 adminRouter.get("/events", getAdminEvents);
 adminRouter.get("/vaults/:contractId/audit", getVaultAudit);
+// Epoch yield outliers detected by the daily scan (#1073). Read-only, so the
+// router-wide readonly requirement is enough.
+adminRouter.get("/vaults/:contractId/epoch-anomalies", getEpochAnomalies);
 adminRouter.get("/vaults/archived", getArchivedVaults);
 adminRouter.patch("/vaults/:contractId/archive-exclusion", requireApiKey({ role: "admin" }), toggleVaultArchiveExclusion);
 adminRouter.get("/archive/verify", verifyArchiveConsistency);
@@ -103,9 +114,15 @@ adminRouter.get("/api-keys/:id/usage", requireApiKey({ role: "admin" }), getApiK
 adminRouter.delete("/api-keys/:id", requireApiKey({ role: "admin" }), deleteApiKey);
 adminRouter.patch("/api-keys/:id/description", requireApiKey({ role: "admin" }), updateApiKeyDescription);
 adminRouter.get("/api-diff", getApiDiff);
-adminRouter.get("/webhooks/:id/deliveries", getWebhookDeliveries);
 // Issue #1006: bulk webhook enable/disable
 adminRouter.post("/webhooks/bulk/toggle", requireApiKey({ role: "admin" }), bulkToggleWebhooks);
+// Issues #1061/#1062/#1063: circuit breaker reset, secret rotation, delivery replay.
+// Registered before /webhooks/:id/deliveries so the literal `deliveries` segment
+// is not swallowed by the `:id` param.
+adminRouter.post("/webhooks/deliveries/:deliveryId/replay", requireApiKey({ role: "admin" }), replayWebhookDelivery);
+adminRouter.get("/webhooks/:id/deliveries", getWebhookDeliveries);
+adminRouter.post("/webhooks/:id/circuit-reset", requireApiKey({ role: "admin" }), resetWebhookCircuit);
+adminRouter.post("/webhooks/:id/rotate-secret", requireApiKey({ role: "admin" }), rotateWebhookSecret);
 adminRouter.get("/db/stats", getDbStats);
 adminRouter.get("/db/slow-queries", getSlowQueries);
 adminRouter.get("/fees", getAdminFees);
@@ -157,4 +174,9 @@ adminRouter.get("/archive/status", requireApiKey({ minRole: "readonly" }), getAr
 
 // Fee tiers and fee rebates (#1099, #1103)
 adminRouter.use("/vaults", adminFeesRouter);
+
+// Issues #1077, #1078: Transfer alerts
+adminRouter.get("/transfer-alerts", getTransferAlerts);
+adminRouter.patch("/transfer-alerts/:id/acknowledge", acknowledgeTransferAlert);
+
 

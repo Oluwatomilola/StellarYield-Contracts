@@ -12,6 +12,8 @@ import {
   getVaultSnapshot,
   getVaultMetadataHistory,
   getWhitelistHistory,
+  getVaultStatusHistory,
+  getTransferVolume,
   getVaultTopHolders,
   getVaultHolders,
   getVaultHolderCount,
@@ -34,6 +36,8 @@ import {
   getSimilarVaults,
   getFeeHistory,
   getVaultFees,
+  getVaultTransferFees,
+  getVaultTransferLeaderboard,
   getCooperatorFees,
   streamVaultEvents,
   getVaultsBulkStatus,
@@ -193,6 +197,13 @@ const whitelistHistoryQuerySchema = z.object({
   pageSize: z.coerce.number().int().min(1).default(20).transform((value) => Math.min(value, 100)),
 });
 
+// Share transfer volume (#1074). A closed set of periods rather than a free-form
+// day count: the analytics widgets only ever ask for these three, and an
+// arbitrary window would make the reported number hard to compare across calls.
+const transferVolumeQuerySchema = z.object({
+  period: z.enum(["1d", "7d", "30d"]).default("7d"),
+});
+
 // TVL history endpoint (#864): from/to range plus explicit bucket strategy.
 const tvlHistoryQuerySchema = z.object({
   from: z.string().optional(),
@@ -290,6 +301,16 @@ vaultsRouter.get(
   validateQuery(whitelistHistoryQuerySchema),
   getWhitelistHistory,
 );
+// Status / manager change history: GET /api/v1/vaults/:contractId/status-history (#1065, #1068)
+vaultsRouter.get("/:contractId/status-history", validateParams(vaultParamsSchema), getVaultStatusHistory);
+// Share transfer volume for a vault token (#1074):
+// GET /api/v1/vaults/:contractId/transfer-volume?period=1d|7d|30d
+vaultsRouter.get(
+  "/:contractId/transfer-volume",
+  validateParams(vaultParamsSchema),
+  validateQuery(transferVolumeQuerySchema),
+  getTransferVolume,
+);
 // Get vault TVL history: GET /api/v1/vaults/:contractId/tvl-history
 vaultsRouter.get(
   "/:contractId/tvl-history",
@@ -325,3 +346,8 @@ vaultsRouter.get("/:contractId/report", validateParams(vaultParamsSchema), getVa
 vaultsRouter.get("/:contractId/epochs/:epoch/breakdown", validateParams(vaultParamsSchema), getEpochBreakdown);
 // Similar vaults by category and TVL proximity: GET /api/v1/vaults/:contractId/similar
 vaultsRouter.get("/:contractId/similar", validateParams(vaultParamsSchema), getSimilarVaults);
+// Transfer fees query: GET /api/v1/vaults/:contractId/transfer-fees?from=&to= (#1076)
+vaultsRouter.get("/:contractId/transfer-fees", validateParams(vaultParamsSchema), getVaultTransferFees);
+// Transfer leaderboard: GET /api/v1/vaults/:contractId/transfer-leaderboard?limit=10 (#1075)
+vaultsRouter.get("/:contractId/transfer-leaderboard", validateParams(vaultParamsSchema), getVaultTransferLeaderboard);
+
