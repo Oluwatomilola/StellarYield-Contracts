@@ -14,6 +14,19 @@ describe("YieldService", () => {
     vi.clearAllMocks();
   });
 
+  describe("overflow-safe i128 helpers", () => {
+    it("rejects overflow on safe multiplication and preserves contract truncation semantics", async () => {
+      const { safeAdd, safeSub, safeMul, mulDiv, AmountOverflowError } = await import("../utils/amount.js");
+
+      expect(safeAdd(1n, 2n)).toBe(3n);
+      expect(safeSub(10n, 3n)).toBe(7n);
+      expect(() => safeMul(2n ** 100n, 2n ** 100n)).toThrow(AmountOverflowError);
+      expect(mulDiv(7n, 5n, 2n)).toBe(17n);
+      expect(mulDiv(-7n, 5n, 2n)).toBe(-17n);
+      expect(() => mulDiv(1n, 1n, 0n)).toThrow();
+    });
+  });
+
   describe("getVaultEpochs", () => {
     it("returns epochs for a vault contract id", async () => {
       const { query, service } = await getTestContext();
