@@ -3,6 +3,7 @@ import { YieldService, InvalidEpochCursorError } from "../../services/yield.js";
 import { NotificationService } from "../../services/notifications.js";
 import { formatYieldPerShare } from "../../utils/fixedPoint.js";
 import type { Epoch } from "../../types/index.js";
+import { setPaginationLinks } from "../middleware/paginationLinks.js";
 
 /** Default page size for the multi-epoch batch window (#1072). */
 const DEFAULT_EPOCH_PAGE_SIZE = 100;
@@ -85,6 +86,8 @@ export async function getVaultEpochs(req: Request, res: Response, next: NextFunc
     if (nextCursor) {
       res.set(NEXT_CURSOR_HEADER, nextCursor);
     }
+    // RFC 8288 Link header for pagination (#1179).
+    setPaginationLinks(res, req, { nextCursor });
 
     res.json(epochs.map((e) => toEpochSummary(e, claimStats, holderCounts)));
   } catch (err) {
@@ -149,6 +152,23 @@ export async function getEpochDetail(req: Request, res: Response, next: NextFunc
         totalHolders,
       ),
     });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getEpochSummary(req: Request, res: Response, next: NextFunction) {
+  try {
+    const summary = await yieldService.getEpochSummary(
+      String(req.params["contractId"]),
+      Number(req.params["epoch"]),
+    );
+    if (!summary) {
+      res.status(404).json({ error: "NotFound", message: "Epoch not found" });
+      return;
+    }
+
+    res.json(summary);
   } catch (err) {
     next(err);
   }
@@ -459,4 +479,3 @@ export async function getYieldVolatility(
     next(err);
   }
 }
-

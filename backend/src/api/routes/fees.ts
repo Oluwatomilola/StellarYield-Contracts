@@ -11,6 +11,7 @@ import {
 } from "../controllers/fees.js";
 import { requireApiKey } from "../middleware/auth.js";
 import { normalizeAddressParam } from "../middleware/normalizeAddressParams.js";
+import { requireApiKey, enforceApiKeyContractScope } from "../middleware/auth.js";
 
 /** Public: GET /api/v1/platform/fees (#1101). */
 export const platformFeesRouter = Router();
@@ -22,6 +23,7 @@ platformFeesRouter.get("/fees", getPlatformFees);
  */
 export const vaultFeesRouter = Router();
 vaultFeesRouter.param("contractId", normalizeAddressParam("contractId"));
+vaultFeesRouter.param("contractId", enforceApiKeyContractScope); // #1243
 vaultFeesRouter.get("/:contractId/fee-accrual-estimate", getFeeAccrualEstimate); // #1102
 vaultFeesRouter.get("/:contractId/fee-rebates", listFeeRebates); // #1103
 vaultFeesRouter.get("/:contractId/fee-revenue", getFeeRevenue); // #1104

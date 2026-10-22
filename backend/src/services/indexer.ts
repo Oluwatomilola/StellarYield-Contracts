@@ -2,7 +2,7 @@ import { tvlPubSub } from "./tvlPubSub.js";
 import { xdr, scValToNative } from "@stellar/stellar-sdk";
 import { config } from "../config.js";
 import { logger } from "../logger.js";
-import { query } from "../db/index.js";
+import { query, withTransaction } from "../db/index.js";
 import { userServiceInstance } from "./userSingleton.js";
 import {
   getSorobanRpc,
@@ -16,14 +16,17 @@ import { YieldService } from "./yield.js";
 import { NotificationService } from "./notifications.js";
 import {
   indexerEventsProcessedTotal,
+  indexerLagSeconds,
   indexerLastLedger,
   indexerProcessingDurationSeconds,
 } from "./metrics.js";
 import { cacheDel } from "../cache/redis.js";
 import { sseService } from "./sse.js";
 import { recordRpcSuccess, recordRpcError } from "./rpcMonitor.js";
+import { timedRpcCall } from "./rpcClient.js";
 import { TOPIC_EVENT_TYPES } from "./indexerEventTypes.js";
 import { logSystemAudit } from "./adminAuditLog.js";
+import { recordLedgerAnchor, ledgerToTimestamp } from "./ledgerEstimator.js";
 
 // ── Lightweight trace spans (#827) ────────────────────────────────────────────
 // No external tracing dependency — spans are emitted as structured pino log
@@ -99,10 +102,17 @@ function parseRawEventName(rawEvent: any): { topics: unknown[]; data: unknown } 
   return { topics, data };
 }
 
-async function withBackoff<T>(
+// Upper bound on any single retry wait (#1204).
+export const RPC_BACKOFF_MAX_DELAY_MS = 30_000;
+
+// Full jitter (#1204): each retry waits a random time between 0 and the
+// exponential ceiling, so instances rate-limited together do not retry in
+// lockstep. `random` is injectable so tests can pass a seeded source.
+export async function withBackoff<T>(
   fn: () => Promise<T>,
   retries = 5,
   startDelayMs = 1000,
+  random: () => number = Math.random,
 ): Promise<T> {
   let attempt = 0;
   while (true) {
@@ -117,7 +127,7 @@ async function withBackoff<T>(
         err?.status === 429 ||
         String(err?.message ?? "").includes("429");
       if (!is429 || attempt >= retries) throw err;
-      const delayMs = Math.min(startDelayMs * Math.pow(2, attempt), 60_000);
+      const delayMs = Math.min(random() * startDelayMs * Math.pow(2, attempt), RPC_BACKOFF_MAX_DELAY_MS);
       logger.warn(
         { attempt: attempt + 1, delayMs },
         "RPC 429 rate-limit; retrying with backoff",
@@ -286,7 +296,7 @@ export class Indexer {
       }
 
       const server = getSorobanRpc();
-      const { sequence: tipLedger } = await withBackoff(() => server.getLatestLedger());
+      const { sequence: tipLedger } = await withBackoff(() => timedRpcCall("getLatestLedger", () => server.getLatestLedger()));
       const gap = tipLedger - this.lastLedger;
 
       if (gap > config.indexer.batchSize) {
@@ -313,7 +323,7 @@ export class Indexer {
 
     let latestLedger: number;
     try {
-      const resp = await withBackoff(() => server.getLatestLedger());
+      const resp = await withBackoff(() => timedRpcCall("getLatestLedger", () => server.getLatestLedger()));
       latestLedger = resp.sequence;
     } catch (err) {
       logger.warn({ err }, "RPC error fetching latest ledger during state-only tick");
@@ -328,6 +338,7 @@ export class Indexer {
 
     this.lastLedger = latestLedger;
     await this.saveLastIndexedLedger(latestLedger);
+    await this.recordAnchorsIfNeeded(this.lastLedger, latestLedger, []);
     logger.info({ ledger: latestLedger }, "state-only tick complete");
     this.lastTickAt = new Date();
   }
@@ -338,7 +349,7 @@ export class Indexer {
 
     let latestLedger: number;
     try {
-      const resp = await withBackoff(() => server.getLatestLedger());
+      const resp = await withBackoff(() => timedRpcCall("getLatestLedger", () => server.getLatestLedger()));
       latestLedger = resp.sequence;
     } catch (err) {
       logger.warn({ err }, "RPC error fetching latest ledger during tick");
@@ -352,6 +363,9 @@ export class Indexer {
     if (lag > threshold) {
       logger.error(`Indexer lag: ${lag} ledgers behind chain tip`);
     }
+    // #1217 — expose lag as a Prometheus gauge (ledgers × 5 s/ledger).
+    // Resets to 0 when caught up so alert rules can fire on any nonzero value.
+    indexerLagSeconds.set(Math.max(0, lag) * 5);
 
     if (latestLedger <= this.lastLedger) {
       finishSpan(tickSpan, { ledgerRange: 0, eventCount: 0 });
@@ -373,9 +387,8 @@ export class Indexer {
     if (contractIds.length > 0 || this.watchedContractIds.size === 0) {
       const filters = contractIds.map((id) => ({ contractIds: [id] }));
       try {
-        const resp = await withBackoff(() =>
-          server.getEvents({ startLedger: from, filters }),
-        );
+        const params = { startLedger: from, filters };
+        const resp = await withBackoff(() => timedRpcCall("getEvents", () => server.getEvents(params), params));
         events = resp.events;
       } catch (err) {
         logger.warn({ err, from, to: latestLedger }, "RPC error fetching events during tick");
@@ -392,15 +405,28 @@ export class Indexer {
       "Indexer tick complete",
     );
 
-    for (const event of events) {
-      await this.processEvent(event, tickSpan);
+    // Events and the cursor commit together (#1210): a failure part-way through
+    // rolls the whole batch back, so the next tick re-fetches the same range.
+    try {
+      await withTransaction(async () => {
+        for (const event of events) {
+          await this.processEvent(event, tickSpan);
+        }
+        await this.saveLastIndexedLedger(latestLedger);
+        await this.recordAnchorsIfNeeded(from, latestLedger, events);
+      });
+    } catch (err) {
+      endBatchTimer();
+      logger.error({ err, from, to: latestLedger }, "Indexer batch failed; rolled back, cursor not advanced");
+      finishSpan(tickSpan, { error: true });
+      return;
     }
     endBatchTimer();
 
     await this.notificationService?.processRetries();
 
     this.lastLedger = latestLedger;
-    await this.persistLastLedger();
+    indexerLastLedger.set(latestLedger);
     this.lastTickAt = new Date();
     finishSpan(tickSpan);
   }
@@ -436,22 +462,26 @@ export class Indexer {
 
       const endBatchTimer = indexerProcessingDurationSeconds.startTimer();
       try {
-        const resp = await withBackoff(() =>
-          server.getEvents({ startLedger: cursor + 1, filters }),
-        );
+        const params = { startLedger: cursor + 1, filters };
+        const resp = await withBackoff(() => timedRpcCall("getEvents", () => server.getEvents(params), params));
 
-        for (const event of resp.events) {
-          logger.debug(
-            { contractId: event.contractId, type: event.type, ledger: event.ledger },
-            "Backfill event",
-          );
-          await this.processEvent(event);
-        }
+        // Each backfill batch commits its events and cursor atomically (#1210).
+        await withTransaction(async () => {
+          for (const event of resp.events) {
+            logger.debug(
+              { contractId: event.contractId, type: event.type, ledger: event.ledger },
+              "Backfill event",
+            );
+            await this.processEvent(event);
+          }
+          await this.saveLastIndexedLedger(batchTo);
+          await this.recordAnchorsIfNeeded(cursor + 1, batchTo, resp.events);
+        });
         endBatchTimer();
 
         cursor = batchTo;
         this.lastLedger = cursor;
-        await this.persistLastLedger();
+        indexerLastLedger.set(cursor);
         this.lastTickAt = new Date();
 
         batchCount++;
@@ -570,9 +600,8 @@ export class Indexer {
       const batchTo = Math.min(cursor + config.indexer.batchSize, toLedger);
       const endBatchTimer = indexerProcessingDurationSeconds.startTimer();
       try {
-        const resp = await withBackoff(() =>
-          server.getEvents({ startLedger: cursor + 1, filters }),
-        );
+        const params = { startLedger: cursor + 1, filters };
+        const resp = await withBackoff(() => timedRpcCall("getEvents", () => server.getEvents(params), params));
         for (const event of resp.events) {
           // Events past the global cursor are picked up by the regular tick.
           if ((event.ledger ?? 0) > toLedger) continue;
@@ -667,6 +696,28 @@ export class Indexer {
         await this.notificationService?.notify("yield_distributed", yieldDist as any);
       } catch (e) {
         logger.warn({ err: e }, "NotificationService.notify failed for yield_distributed");
+      }
+      return true;
+    }
+
+    const epochFinalized = parseEpochFinalizedEvent(event);
+    if (epochFinalized) {
+      await this.recordEvent(event, "epoch_finalized", {
+        epochId: epochFinalized.epochId,
+        totalYield: epochFinalized.totalYield.toString(),
+        timestamp: epochFinalized.timestamp.toString(),
+      });
+      try {
+        await this.notificationService?.notify("epoch.finalized", {
+          contractId: event.contractId ?? "",
+          epochId: epochFinalized.epochId,
+          totalYield: epochFinalized.totalYield.toString(),
+          timestamp:
+            (typeof event.ledgerClosedAt === "string" && event.ledgerClosedAt) ||
+            new Date(Number(epochFinalized.timestamp) * 1000).toISOString(),
+        });
+      } catch (e) {
+        logger.warn({ err: e }, "NotificationService.notify failed for epoch.finalized");
       }
       return true;
     }
@@ -1289,6 +1340,10 @@ export class Indexer {
       const { shares, deposited } = positionResult[0];
       userServiceInstance.emitPositionUpdate(withdraw.owner, contractId, shares, deposited);
     }
+
+    // #1274 – re-derive settlement_status after every withdrawal so dashboards
+    // can see the transition from not_started → in_progress → complete.
+    await this.refreshSettlementStatus(contractId);
   }
 
   private async handleYieldDistributed(
@@ -1443,13 +1498,61 @@ export class Indexer {
   ): Promise<void> {
     if (!stateChange.newState) return;
 
-    await query(
-      `UPDATE vaults SET state = $1, updated_at = NOW() WHERE contract_id = $2`,
-      [stateChange.newState, contractId],
-    );
+    // #1274 – when a vault enters Matured set settlement_status to not_started
+    // (no redemptions have occurred yet).  Closed vaults are fully settled.
+    const settlementStatus =
+      stateChange.newState === "Matured"
+        ? "not_started"
+        : stateChange.newState === "Closed"
+          ? "complete"
+          : null;
+
+    if (stateChange.newState === "Matured") {
+      // #1275 – freeze the supply at the moment of maturity so redeemedPct has
+      // a fixed baseline to divide against as shares are redeemed afterwards.
+      await query(
+        `UPDATE vaults SET state = $1, settlement_status = $2, supply_at_maturity = total_supply, updated_at = NOW() WHERE contract_id = $3`,
+        [stateChange.newState, settlementStatus, contractId],
+      );
+    } else if (settlementStatus !== null) {
+      await query(
+        `UPDATE vaults SET state = $1, settlement_status = $2, updated_at = NOW() WHERE contract_id = $3`,
+        [stateChange.newState, settlementStatus, contractId],
+      );
+    } else {
+      await query(
+        `UPDATE vaults SET state = $1, updated_at = NOW() WHERE contract_id = $2`,
+        [stateChange.newState, contractId],
+      );
+    }
     logger.info(
       { contractId, oldState: stateChange.oldState, newState: stateChange.newState },
       "Processed vault_state_changed event",
+    );
+  }
+
+  /**
+   * Re-derive and persist the settlement_status for a Matured vault.
+   * Called after any withdrawal or redemption that may change the supply.
+   * #1274
+   */
+  private async refreshSettlementStatus(contractId: string): Promise<void> {
+    const rows = await query<{ state: string; total_supply: string }>(
+      "SELECT state, total_supply FROM vaults WHERE contract_id = $1",
+      [contractId],
+    );
+    if (rows.length === 0) return;
+    const { state, total_supply } = rows[0];
+
+    if (state !== "Matured" && state !== "Closed") return; // only relevant post-maturity
+
+    const remainingSupply = BigInt(total_supply ?? "0");
+    const settlementStatus =
+      remainingSupply === 0n ? "complete" : "in_progress";
+
+    await query(
+      `UPDATE vaults SET settlement_status = $1, updated_at = NOW() WHERE contract_id = $2`,
+      [settlementStatus, contractId],
     );
   }
 
@@ -2075,11 +2178,6 @@ export class Indexer {
     );
   }
 
-  private async persistLastLedger(): Promise<void> {
-    await this.saveLastIndexedLedger(this.lastLedger);
-    indexerLastLedger.set(this.lastLedger);
-  }
-
   async getLastIndexedLedger(): Promise<number> {
     const rows = await query<{ last_ledger: number }>(
       "SELECT last_ledger FROM indexer_state LIMIT 1",
@@ -2120,6 +2218,27 @@ export class Indexer {
        ON CONFLICT (id) DO UPDATE SET start_ledger = EXCLUDED.start_ledger, updated_at = NOW()`,
       [startBlock],
     );
+  }
+
+  /**
+   * Populate ledger_anchors every 1000 ledgers.
+   */
+  async recordAnchorsIfNeeded(fromLedger: number, toLedger: number, events: any[]): Promise<void> {
+    const startThousand = Math.ceil(fromLedger / 1000) * 1000;
+    for (let seq = startThousand; seq <= toLedger; seq += 1000) {
+      if (seq <= 0) continue;
+      let closedAt: Date | null = null;
+      for (const ev of events) {
+        if (ev.ledger === seq && typeof ev.ledgerClosedAt === "string") {
+          closedAt = new Date(ev.ledgerClosedAt);
+          break;
+        }
+      }
+      if (!closedAt) {
+        closedAt = new Date();
+      }
+      await recordLedgerAnchor(seq, closedAt);
+    }
   }
 
   private async sleepWhileRunning(ms: number): Promise<void> {
@@ -2363,6 +2482,45 @@ export function parseYieldDistributedEvent(rawEvent: unknown): ParsedYieldDistri
     const timestamp = decodeBigInt(arr[1]);
 
     return { epoch, amount, timestamp };
+  } catch {
+    return null;
+  }
+}
+
+export interface ParsedEpochFinalizedEvent {
+  epochId: number;
+  totalYield: bigint;
+  timestamp: bigint;
+}
+
+export function parseEpochFinalizedEvent(rawEvent: unknown): ParsedEpochFinalizedEvent | null {
+  try {
+    if (!rawEvent || typeof rawEvent !== "object") return null;
+    const ev = rawEvent as Record<string, unknown>;
+    const topics = (ev["topic"] ?? ev["topics"]) as unknown[] | undefined;
+    const value = ev["value"] ?? ev["data"];
+
+    if (!Array.isArray(topics) || topics.length < 2 || value == null) return null;
+
+    const parsedTopics = topics.map((t) =>
+      typeof t === "string" ? xdr.ScVal.fromXDR(t, "base64") : (t as xdr.ScVal),
+    );
+    const parsedValue = typeof value === "string"
+      ? xdr.ScVal.fromXDR(value, "base64")
+      : value;
+
+    const eventName = String(scValToNative(parsedTopics[0]) ?? "");
+    if (eventName !== "epoch_finalized" && eventName !== "epoch_fin") return null;
+
+    const epochId = Number(scValToNative(parsedTopics[1]) ?? 0);
+    const data = scValToNative(parsedValue as xdr.ScVal);
+    const arr = Array.isArray(data) ? data : Object.values((data as Record<string, unknown>) ?? {});
+
+    return {
+      epochId,
+      totalYield: decodeBigInt(arr[0]),
+      timestamp: decodeBigInt(arr[1]),
+    };
   } catch {
     return null;
   }

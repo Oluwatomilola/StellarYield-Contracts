@@ -8,6 +8,8 @@ export const TOPIC_EVENT_TYPES: Record<string, string> = {
   deposit: "deposit",
   withdraw: "withdraw",
   yield_dis: "yield_distributed",
+  epoch_finalized: "epoch_finalized",
+  epoch_fin: "epoch_finalized",
   st_chg: "vault_state_changed",
   vault_state_changed: "vault_state_changed",
   rwa_upd: "rwa_details_updated",

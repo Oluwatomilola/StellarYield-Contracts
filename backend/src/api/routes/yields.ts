@@ -4,6 +4,7 @@ import {
   getVaultEpochs,
   getEpochYieldPerShare,
   getEpochDetail,
+  getEpochSummary,
   getBulkEpochs,
   getUserPendingYield,
   getYieldSummary,
@@ -18,7 +19,7 @@ import {
   getYieldVolatility,
 } from "../controllers/yields.js";
 import { getYieldsStream } from "../controllers/yields-stream.js";
-import { validateQuery, validateParams } from "../middleware/validate.js";
+import { validateQuery, validateParams, MAX_DATE_RANGE_DAYS } from "../middleware/validate.js";
 import { sseLimitPerIp } from "../middleware/sseLimitPerIp.js";
 import { normalizeAddressParam } from "../middleware/normalizeAddressParams.js";
 
@@ -75,12 +76,25 @@ const epochQuerySchema = z
       });
     }
 
-    if (value.from !== undefined && value.to !== undefined && value.from > value.to) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["from"],
-        message: "from must not be greater than to",
-      });
+    if (value.from !== undefined && value.to !== undefined) {
+      if (value.from > value.to) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["from"],
+          message: "from must not be greater than to",
+        });
+      } else {
+        // Epoch numbers are sequence numbers, not Unix timestamps, but apply
+        // the same maximum span guard to prevent runaway pagination (#1235).
+        const span = value.to - value.from;
+        if (span > MAX_DATE_RANGE_DAYS) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["to"],
+            message: `Epoch range must not exceed ${MAX_DATE_RANGE_DAYS} (requested ${span})`,
+          });
+        }
+      }
     }
   });
 
@@ -113,6 +127,11 @@ yieldsRouter.get("/stream", sseLimitPerIp(), getYieldsStream);
 yieldsRouter.get("/:contractId/summary", getYieldSummary);
 yieldsRouter.get("/:contractId/epochs", validateQuery(epochQuerySchema), getVaultEpochs);
 yieldsRouter.get("/:contractId/epochs/bulk", getBulkEpochs);
+yieldsRouter.get(
+  "/:contractId/epochs/:epoch/summary",
+  validateParams(epochDetailParamsSchema),
+  getEpochSummary,
+);
 yieldsRouter.get(
   "/:contractId/epochs/:epoch",
   validateParams(epochDetailParamsSchema),
@@ -164,4 +183,3 @@ const timelineQuerySchema = z.object({
 });
 
 yieldsRouter.get("/:contractId/timeline", validateQuery(timelineQuerySchema), getYieldTimeline);
-

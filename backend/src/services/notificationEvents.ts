@@ -7,6 +7,7 @@ export const KNOWN_EVENTS = [
   "deposit",
   "withdraw",
   "yield_distributed",
+  "epoch.finalized",
   "yield_claimed",
   "vault_state_changed",
   "vault_created",

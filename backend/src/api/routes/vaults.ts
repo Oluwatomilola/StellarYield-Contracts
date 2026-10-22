@@ -9,7 +9,7 @@ import {
   getVaultLiveState,
   getVaultLiveTotalAssets,
   getRedemptionQueue,
-  getVaultSnapshot,
+  getVaultSnapshotV2 as getVaultSnapshot,
   getVaultMetadataHistory,
   getWhitelistHistory,
   getVaultStatusHistory,
@@ -19,6 +19,8 @@ import {
   getVaultHolderCount,
   exportVaultHoldersCsv,
   getVaultTvlHistory,
+  getVaultTvlGrowth,
+  getVaultFlowsDaily,
   getEarlyRedemptionFee,
   exportVaultCsv,
   getVaultOperators,
@@ -42,19 +44,28 @@ import {
   streamVaultEvents,
   getVaultsBulkStatus,
   validateVaultMetadata,
+  getDepositDistribution,
+  getVaultCohorts,
+  getHoldingDuration,
+  getVaultSnapshotWithRatios,
+  getFundingVelocity,
+  getRedemptionQueueEta,
+  getMaturityCountdown,
+  getRedemptionStats,
+  getRedemptionCancellationRate,
+  getHolderRetention,
 } from "../controllers/vaults.js";
 import {
   translateSimulationError,
   simulateFundingProgress,
   simulateMultiOperation,
 } from "../controllers/simulate.js";
-import { validateParams, validateQuery, validateBody } from "../middleware/validate.js";
-import { requireApiKey } from "../middleware/auth.js";
+import { validateParams, validateQuery, validateBody, nfcStringSchema, contractAddressSchema } from "../middleware/validate.js";
+import { requireApiKey, enforceApiKeyContractScope } from "../middleware/auth.js";
 import { simulateLimiter } from "../middleware/rateLimit.js";
 import { normalizeAddressParam } from "../middleware/normalizeAddressParams.js";
+import { captureForStaleFallback } from "../middleware/staleResponse.js";
 import { parseVaultSort } from "../../services/vault.js";
-
-const contractAddressSchema = z.string().length(56).regex(/^C[A-Z2-7]{55}$/);
 
 // Accepts a calendar date (2025-01-31) or a full ISO 8601 date-time, with or
 // without an offset.
@@ -164,7 +175,11 @@ const vaultHoldersQuerySchema = z.object({
 });
 
 const searchVaultsQuerySchema = z.object({
-  q: z.string().optional(),
+  q: z
+    .string()
+    .max(200, "Search query must be at most 200 characters")
+    .regex(/^[^\x00-\x1f\x7f]*$/, "Search query must not contain control characters")
+    .optional(),
   category: z.string().optional(),
   state: z.string().optional(),
   sort: z.enum(["created_at", "total_assets"]).default("created_at"),
@@ -215,9 +230,13 @@ const tvlHistoryQuerySchema = z.object({
 export const vaultsRouter = Router();
 vaultsRouter.param("contractId", normalizeAddressParam("contractId"));
 vaultsRouter.param("address", normalizeAddressParam("address"));
+// Vault scope for keys that carry an `allowed_contract_ids` list (#1243). Runs
+// for every route that names a contract, before its handler.
+vaultsRouter.param("contractId", enforceApiKeyContractScope);
 
 vaultsRouter.get("/categories", listCategories);
-vaultsRouter.get("/", validateQuery(listVaultsQuerySchema), listVaults);
+// Public list and detail reads keep a stale copy for outage fallback (#1254).
+vaultsRouter.get("/", validateQuery(listVaultsQuerySchema), captureForStaleFallback, listVaults);
 vaultsRouter.get("/count", getVaultCount);
 // Aggregates endpoint (placed before dynamic :contractId routes)
 const aggregatesQuerySchema = z.object({ state: z.string().optional() });
@@ -245,10 +264,10 @@ vaultsRouter.post(
 );
 // Issue #976: Vault metadata validation
 export const metadataValidationSchema = z.object({
-  name: z.string().optional(),
+  name: nfcStringSchema.optional(),
   documentUri: z.string().optional(),
   logoUri: z.string().optional(),
-  description: z.string().optional(),
+  description: nfcStringSchema.optional(),
 });
 vaultsRouter.post("/metadata/validate", validateBody(metadataValidationSchema), validateVaultMetadata);
 vaultsRouter.get("/factory/:factoryId", validateParams(vaultFactoryParamsSchema), listVaultsByFactory);
@@ -266,7 +285,13 @@ vaultsRouter.post(
   validateParams(vaultParamsSchema),
   simulateMultiOperation,
 );
-vaultsRouter.get("/:contractId", validateParams(vaultParamsSchema), validateQuery(vaultDetailQuerySchema), getVault);
+vaultsRouter.get(
+  "/:contractId",
+  validateParams(vaultParamsSchema),
+  validateQuery(vaultDetailQuerySchema),
+  captureForStaleFallback,
+  getVault,
+);
 vaultsRouter.get("/:contractId/state/live", validateParams(vaultParamsSchema), getVaultLiveState);
 vaultsRouter.get("/:contractId/total-assets/live", validateParams(vaultParamsSchema), getVaultLiveTotalAssets);
 vaultsRouter.get("/:contractId/redemption-queue", validateParams(vaultParamsSchema), getRedemptionQueue);
@@ -289,7 +314,18 @@ vaultsRouter.get(
   getVaultHolders,
 );
 // Get vault snapshot: GET /api/v1/vaults/:contractId/snapshot
-vaultsRouter.get("/:contractId/snapshot", validateParams(vaultParamsSchema), getVaultSnapshot);
+// Issue #1267: snapshot now includes withdrawalRatio7d and withdrawalRatio30d
+vaultsRouter.get("/:contractId/snapshot", validateParams(vaultParamsSchema), getVaultSnapshotWithRatios);
+// Issue #1264: average holding duration: GET /api/v1/vaults/:contractId/holding-duration
+vaultsRouter.get("/:contractId/holding-duration", validateParams(vaultParamsSchema), getHoldingDuration);
+// Issue #1268: funding velocity: GET /api/v1/vaults/:contractId/funding-velocity
+vaultsRouter.get("/:contractId/funding-velocity", validateParams(vaultParamsSchema), getFundingVelocity);
+// Issue #1269: redemption queue ETA: GET /api/v1/vaults/:contractId/redemption-queue/:address/eta
+vaultsRouter.get(
+  "/:contractId/redemption-queue/:address/eta",
+  validateParams(z.object({ contractId: contractAddressSchema, address: z.string().min(1) })),
+  getRedemptionQueueEta,
+);
 // Metadata change history: GET /api/v1/vaults/:contractId/metadata-history (#973)
 vaultsRouter.get(
   "/:contractId/metadata-history",
@@ -353,4 +389,33 @@ vaultsRouter.get("/:contractId/similar", validateParams(vaultParamsSchema), getS
 vaultsRouter.get("/:contractId/transfer-fees", validateParams(vaultParamsSchema), getVaultTransferFees);
 // Transfer leaderboard: GET /api/v1/vaults/:contractId/transfer-leaderboard?limit=10 (#1075)
 vaultsRouter.get("/:contractId/transfer-leaderboard", validateParams(vaultParamsSchema), getVaultTransferLeaderboard);
+// Maturity countdown: GET /api/v1/vaults/:contractId/maturity-countdown (#1273)
+vaultsRouter.get("/:contractId/maturity-countdown", validateParams(vaultParamsSchema), getMaturityCountdown);
+// Redemption processing latency stats: GET /api/v1/vaults/:contractId/redemption-stats (#1271)
+vaultsRouter.get("/:contractId/redemption-stats", validateParams(vaultParamsSchema), getRedemptionStats);
+// Redemption cancellation rate: GET /api/v1/vaults/:contractId/redemption-stats/cancellation (#1272)
+vaultsRouter.get("/:contractId/redemption-stats/cancellation", validateParams(vaultParamsSchema), getRedemptionCancellationRate);
+// Holder retention across epochs: GET /api/v1/vaults/:contractId/retention?epochs=5 (#1263)
+const retentionQuerySchema = z.object({ epochs: z.coerce.number().int().min(1).max(100).default(5) });
+vaultsRouter.get("/:contractId/retention", validateParams(vaultParamsSchema), validateQuery(retentionQuerySchema), getHolderRetention);
+
+// Deposit size distribution histogram: GET /api/v1/vaults/:contractId/deposit-distribution?buckets=N (#1265)
+const depositDistributionQuerySchema = z.object({
+  buckets: z.coerce.number().int().min(2).max(50).default(10),
+});
+vaultsRouter.get(
+  "/:contractId/deposit-distribution",
+  validateParams(vaultParamsSchema),
+  validateQuery(depositDistributionQuerySchema),
+  getDepositDistribution,
+);
+
+// Holder cohorts by first-deposit month: GET /api/v1/vaults/:contractId/cohorts (#1266)
+vaultsRouter.get("/:contractId/cohorts", validateParams(vaultParamsSchema), getVaultCohorts);
+
+// Issue #1260: TVL growth rate: GET /api/v1/vaults/:contractId/tvl/growth
+vaultsRouter.get("/:contractId/tvl/growth", validateParams(vaultParamsSchema), getVaultTvlGrowth);
+
+// Issue #1261: Net deposits per day: GET /api/v1/vaults/:contractId/flows/daily?from=&to=
+vaultsRouter.get("/:contractId/flows/daily", validateParams(vaultParamsSchema), getVaultFlowsDaily);
 
