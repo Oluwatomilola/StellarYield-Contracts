@@ -51,6 +51,7 @@ import {
 import { validateParams, validateQuery, validateBody } from "../middleware/validate.js";
 import { requireApiKey } from "../middleware/auth.js";
 import { simulateLimiter } from "../middleware/rateLimit.js";
+import { normalizeAddressParam } from "../middleware/normalizeAddressParams.js";
 import { parseVaultSort } from "../../services/vault.js";
 
 const contractAddressSchema = z.string().length(56).regex(/^C[A-Z2-7]{55}$/);
@@ -212,6 +213,8 @@ const tvlHistoryQuerySchema = z.object({
 });
 
 export const vaultsRouter = Router();
+vaultsRouter.param("contractId", normalizeAddressParam("contractId"));
+vaultsRouter.param("address", normalizeAddressParam("address"));
 
 vaultsRouter.get("/categories", listCategories);
 vaultsRouter.get("/", validateQuery(listVaultsQuerySchema), listVaults);

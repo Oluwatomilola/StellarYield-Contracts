@@ -20,6 +20,7 @@ import {
 import { getYieldsStream } from "../controllers/yields-stream.js";
 import { validateQuery, validateParams } from "../middleware/validate.js";
 import { sseLimitPerIp } from "../middleware/sseLimitPerIp.js";
+import { normalizeAddressParam } from "../middleware/normalizeAddressParams.js";
 
 // Yield amounts exceed Number.MAX_SAFE_INTEGER, so BigInt-safe strings are kept
 // as strings all the way to the ::numeric cast rather than coerced to a number.
@@ -105,6 +106,8 @@ const yieldHistoryQuerySchema = z.object({
 });
 
 export const yieldsRouter = Router();
+yieldsRouter.param("contractId", normalizeAddressParam("contractId"));
+yieldsRouter.param("userAddress", normalizeAddressParam("userAddress"));
 
 yieldsRouter.get("/stream", sseLimitPerIp(), getYieldsStream);
 yieldsRouter.get("/:contractId/summary", getYieldSummary);
