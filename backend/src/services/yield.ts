@@ -3,6 +3,7 @@ import { query } from "../db/index.js";
 import { cacheGet, cacheSet, cacheDel } from "../cache/redis.js";
 import { config } from "../config.js";
 import { FIXED_POINT_DECIMALS, formatYieldPerShare, parseFixedPoint } from "../utils/fixedPoint.js";
+import { mulDiv, safeAdd, safeSub } from "../utils/amount.js";
 
 const EPOCHS_CACHE_TTL = 30;
 const PENDING_YIELD_CACHE_TTL = 10;
@@ -365,7 +366,7 @@ export class YieldService {
     const claimStats = await this.getEpochClaimStats(contractId, epoch);
     const totalYield = BigInt(row.yield_amount);
     const claimed = BigInt(claimStats.claimedAmount);
-    const unclaimed = totalYield > claimed ? totalYield - claimed : BigInt(0);
+    const unclaimed = totalYield > claimed ? safeSub(totalYield, claimed) : BigInt(0);
 
     return {
       epoch: row.epoch,
@@ -563,9 +564,9 @@ export class YieldService {
         continue;
       }
 
-      const epochYield = (BigInt(row.yield_amount) * shares) / totalShares;
+      const epochYield = mulDiv(BigInt(row.yield_amount), shares, totalShares);
       if (epochYield > BigInt(0)) {
-        pendingYield += epochYield;
+        pendingYield = safeAdd(pendingYield, epochYield);
         pendingEpochs.push(row.epoch);
       }
     }
@@ -794,7 +795,7 @@ export class YieldService {
     const participationA = this.calculateParticipationRate(claimA.uniqueClaimants, holdersA);
     const participationB = this.calculateParticipationRate(claimB.uniqueClaimants, holdersB);
 
-    const deltaYield = BigInt(rowB.yieldAmount) - BigInt(rowA.yieldAmount);
+    const deltaYield = safeSub(BigInt(rowB.yieldAmount), BigInt(rowA.yieldAmount));
     const deltaYps = (() => {
       const ypsA = this.parseYieldPerShare(rowA.yieldPerShare);
       const ypsB = this.parseYieldPerShare(rowB.yieldPerShare);
